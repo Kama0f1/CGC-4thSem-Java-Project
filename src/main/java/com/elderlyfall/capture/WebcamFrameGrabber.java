@@ -20,14 +20,28 @@ import static org.bytedeco.opencv.global.opencv_imgproc.*;
 import static org.bytedeco.opencv.global.opencv_video.createBackgroundSubtractorMOG2;
 
 /**
- * Captures webcam frames and detects a person using MOG2 background subtraction.
+ * Captures webcam frames and detects a person using MOG2 + convex hull merging.
  *
- * Stability fixes:
- *  - Bounding box is smoothed using Exponential Moving Average (EMA)
- *    so it glides toward the new position instead of jumping each frame
- *  - Large dilate kernel merges all body motion into one solid blob
- *  - Box only disappears after DISAPPEAR_GRACE frames of no detection
- *    (avoids flickering when you briefly stay still)
+ * Key improvements over previous version:
+ *
+ * 1. CONVEX HULL MERGING — instead of picking only the largest contour,
+ *    ALL significant contours are merged into one convex hull. This means
+ *    if MOG2 detects your torso, arm, and leg separately, they all get
+ *    wrapped into one single bounding box covering your full visible body.
+ *
+ * 2. SMARTER FALL DETECTION — pure width/height ratio breaks when the
+ *    laptop is tilted (coordinate axes rotate). We now combine three signals:
+ *      a) Aspect ratio (width/height)  — primary signal
+ *      b) Box area relative to frame  — large area = person is close/upright
+ *      c) Vertical position on screen — if box top is near bottom of frame,
+ *         more likely to be on floor
+ *    All three are weighted into a confidence score.
+ *
+ * 3. LARGER DILATE KERNEL — 70x70 (was 55x55) to better merge body parts
+ *    when person is very close to the camera.
+ *
+ * 4. LOWER MIN CONTOUR AREA — 2000px (was 3500px) to catch close-range
+ *    detection where the visible body area per contour is smaller.
  */
 public class WebcamFrameGrabber {
 
@@ -36,21 +50,20 @@ public class WebcamFrameGrabber {
     public static final int FRAME_W = 640;
     public static final int FRAME_H = 480;
 
-    private static final int    MIN_CONTOUR_AREA  = 3500;
-    private static final int    WARMUP_FRAMES     = 50;
+    // Minimum contour area to count — lower for close-range
+    private static final int MIN_CONTOUR_AREA = 2000;
 
-    /**
-     * EMA smoothing factor — lower = smoother but slower to react.
-     * 0.2 means each frame moves 20% toward the raw detection.
-     * Tune between 0.1 (very smooth/slow) and 0.4 (snappier).
-     */
+    // Warmup frames before detection starts
+    private static final int WARMUP_FRAMES = 50;
+
+    // EMA smoothing factor
     private static final double SMOOTH = 0.20;
 
-    /**
-     * How many frames to keep showing the last known box
-     * when detection temporarily drops out.
-     */
-    private static final int DISAPPEAR_GRACE = 12;
+    // Grace frames before box disappears on no detection
+    private static final int DISAPPEAR_GRACE = 15;
+
+    // Fall confidence threshold (0.0 to 1.0) — tune if needed
+    private static final double FALL_CONFIDENCE_THRESHOLD = 0.50;
 
     private final OpenCVFrameGrabber         grabber;
     private final OpenCVFrameConverter.ToMat converter = new OpenCVFrameConverter.ToMat();
@@ -59,19 +72,19 @@ public class WebcamFrameGrabber {
     private final Mat dilateKernel;
 
     private final int    blurKernel;
-    private final double fallRatio;
+    private final double fallRatio;     // kept for reference, used as part of score
     private final long   frameDurationMs;
 
-    private int     frameCounter   = 0;
-    private long    lastGrabTime   = 0;
-    private boolean opened         = false;
+    private int     frameCounter  = 0;
+    private long    lastGrabTime  = 0;
+    private boolean opened        = false;
 
-    // ── Smoothed box state ────────────────────────────────────────────────────
-    /** Current smoothed box (doubles for sub-pixel accuracy during interpolation). */
+    // Smoothed box state
     private double sX = -1, sY = -1, sW = -1, sH = -1;
+    private int    missingFrames  = 0;
 
-    /** Frames since we last had a real detection. */
-    private int missingFrames = 0;
+    // Smoothed fall confidence (EMA applied separately)
+    private double sFallConf = 0.0;
 
     public WebcamFrameGrabber() {
         int    cameraIndex = ConfigLoader.getCameraIndex();
@@ -91,13 +104,12 @@ public class WebcamFrameGrabber {
 
         mog2 = createBackgroundSubtractorMOG2(300, 50, false);
 
-        // Erode removes tiny noise specks
-        erodeKernel  = getStructuringElement(MORPH_ELLIPSE, new Size(5, 5));
-        // Large dilate merges body parts into one big blob
-        dilateKernel = getStructuringElement(MORPH_ELLIPSE, new Size(55, 55));
+        // Slightly larger kernels for better close-range detection
+        erodeKernel  = getStructuringElement(MORPH_ELLIPSE, new Size(5,  5));
+        dilateKernel = getStructuringElement(MORPH_ELLIPSE, new Size(70, 70));
 
-        logger.info("WebcamFrameGrabber (MOG2+EMA): fps={} blur={} fallRatio={} smooth={}",
-                fps, blurKernel, fallRatio, SMOOTH);
+        logger.info("WebcamFrameGrabber (MOG2+Hull): fps={} blur={} fallRatio={}",
+                fps, blurKernel, fallRatio);
     }
 
     public void open() throws FrameGrabber.Exception {
@@ -131,11 +143,11 @@ public class WebcamFrameGrabber {
             Mat resized = new Mat();
             resize(bgr, resized, new Size(FRAME_W, FRAME_H));
 
-            // Privacy blur (display only)
+            // Privacy blur for display
             Mat blurred = new Mat();
             GaussianBlur(resized, blurred, new Size(blurKernel, blurKernel), 0);
 
-            // Grayscale + equalise for stable detection
+            // Grayscale + equalise
             Mat gray = new Mat();
             cvtColor(resized, gray, COLOR_BGR2GRAY);
             equalizeHist(gray, gray);
@@ -145,43 +157,61 @@ public class WebcamFrameGrabber {
             double lr = frameCounter < WARMUP_FRAMES ? 0.05 : 0.005;
             mog2.apply(resized, fgMask, lr);
 
-            // Clean up mask
+            // Cleanup
             erode(fgMask,  fgMask, erodeKernel);
             dilate(fgMask, fgMask, dilateKernel);
 
-            // Find contours
+            // Find all contours
             MatVector contours = new MatVector();
             findContours(fgMask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
 
-            // ── Detect & smooth ───────────────────────────────────────────────
             List<Person> persons = new ArrayList<>();
 
             if (frameCounter >= WARMUP_FRAMES) {
 
-                // Find the largest contour above minimum area
-                Mat    bestContour = null;
-                double bestArea    = 0;
+                // ── STEP 1: Collect ALL significant contour points into one list
+                // This is the key fix — instead of picking the largest contour,
+                // we merge ALL large contours into a single convex hull so the
+                // whole visible body (torso + arms + legs) becomes one box.
+                MatVector significantContours = new MatVector();
+                int sigCount = 0;
                 for (int i = 0; i < contours.size(); i++) {
-                    double area = contourArea(contours.get(i));
-                    if (area > bestArea && area >= MIN_CONTOUR_AREA) {
-                        bestArea    = area;
-                        bestContour = contours.get(i);
+                    if (contourArea(contours.get(i)) >= MIN_CONTOUR_AREA) {
+                        sigCount++;
                     }
                 }
 
-                if (bestContour != null) {
-                    // Raw detection box
-                    Rect r  = boundingRect(bestContour);
-                    double rx = Math.max(0, r.x());
-                    double ry = Math.max(0, r.y());
-                    double rw = Math.min(FRAME_W - rx, r.width());
-                    double rh = Math.min(FRAME_H - ry, r.height());
+                if (sigCount > 0) {
+                    // Build array of significant contours
+                    Mat[] sigArray = new Mat[sigCount];
+                    int idx = 0;
+                    for (int i = 0; i < contours.size(); i++) {
+                        Mat c = contours.get(i);
+                        if (contourArea(c) >= MIN_CONTOUR_AREA) {
+                            sigArray[idx++] = c;
+                        }
+                    }
 
+                    // Concatenate all points into one big mat
+                    // Then compute convex hull of all points → unified bounding box
+                    Mat allPoints = new Mat();
+                    vconcat(new MatVector(sigArray), allPoints);
+
+                    Mat hull = new Mat();
+                    convexHull(allPoints, hull);
+
+                    // Bounding rect of the hull = box around FULL visible body
+                    Rect box = boundingRect(hull);
+
+                    double rx = Math.max(0, box.x());
+                    double ry = Math.max(0, box.y());
+                    double rw = Math.min(FRAME_W - rx, box.width());
+                    double rh = Math.min(FRAME_H - ry, box.height());
+
+                    // ── STEP 2: EMA smooth the box ────────────────────────────
                     if (sX < 0) {
-                        // First detection — initialise smoothed box directly
                         sX = rx; sY = ry; sW = rw; sH = rh;
                     } else {
-                        // EMA: smoothed = smoothed + SMOOTH * (raw - smoothed)
                         sX += SMOOTH * (rx - sX);
                         sY += SMOOTH * (ry - sY);
                         sW += SMOOTH * (rw - sW);
@@ -189,22 +219,81 @@ public class WebcamFrameGrabber {
                     }
                     missingFrames = 0;
 
-                } else {
-                    // No detection this frame
-                    missingFrames++;
-                }
+                    // ── STEP 3: Smarter fall confidence score ─────────────────
+                    //
+                    // Signal A — aspect ratio (width/height)
+                    // Standing: ~0.4-0.7 | Fallen: ~1.5+
+                    double ratio   = sH > 0 ? sW / sH : 0;
+                    double sigA    = Math.min(1.0, Math.max(0, (ratio - 0.9) / (fallRatio - 0.9)));
 
-                // Show the smoothed box as long as we have one and haven't
-                // been missing for too long
-                if (sX >= 0 && missingFrames <= DISAPPEAR_GRACE) {
+                    // Signal B — box area relative to frame
+                    // When fallen, box tends to cover more horizontal area but less vertical
+                    // A very TALL box (large area, small ratio) = clearly standing
+                    double boxArea  = sW * sH;
+                    double frameArea = FRAME_W * FRAME_H;
+                    double relArea  = boxArea / frameArea;
+                    // Penalise if box is very tall relative to its width (clearly standing)
+                    double sigB = ratio < 0.6 ? 0.0 : Math.min(1.0, relArea * 3.0);
+
+                    // Signal C — vertical position
+                    // If the box top edge is in the lower half of the frame, more likely floor
+                    double boxTopRel = (sY + sH * 0.3) / FRAME_H;
+                    double sigC = Math.min(1.0, Math.max(0, (boxTopRel - 0.3) / 0.5));
+
+                    // Weighted confidence: ratio is most important
+                    double rawConf = sigA * 0.60 + sigB * 0.20 + sigC * 0.20;
+
+                    // Smooth the confidence too so it doesn't flicker
+                    sFallConf += 0.25 * (rawConf - sFallConf);
+
+                    boolean fallen = sFallConf >= FALL_CONFIDENCE_THRESHOLD;
+
+                    logger.debug("ratio={:.2f} sigA={:.2f} sigB={:.2f} sigC={:.2f} conf={:.2f} fallen={}",
+                            ratio, sigA, sigB, sigC, sFallConf, fallen);
+
+                    // Create person with a flag encoded in ID:
+                    // ID=1 → detected normally, use isOnFloor(ratio) for fall check
+                    // We override isOnFloor() check via FallDetector callback instead
+                    // So we encode fall state directly in the width/height we report:
+                    // If fallen → make w > h artificially to pass isOnFloor(fallRatio)
+                    // If standing → make h > w to fail isOnFloor(fallRatio)
                     int bx = (int) Math.round(sX);
                     int by = (int) Math.round(sY);
-                    int bw = (int) Math.round(sW);
-                    int bh = (int) Math.round(sH);
+                    int bw, bh;
+
+                    if (fallen) {
+                        // Ensure ratio > fallRatio so FallDetector sees "on floor"
+                        bw = (int) Math.round(sW);
+                        bh = (int) Math.max(1, Math.round(bw / (fallRatio + 0.2)));
+                    } else {
+                        // Ensure ratio < fallRatio so FallDetector sees "upright"
+                        bh = (int) Math.round(sH);
+                        bw = (int) Math.max(1, Math.round(bh * (fallRatio - 0.3)));
+                    }
+
+                    persons.add(new Person(1, bx, by, bw, bh));
+
+                } else {
+                    missingFrames++;
+                    // Decay fall confidence when nothing detected
+                    sFallConf *= 0.85;
+                }
+
+                // Keep showing smoothed box during grace period
+                if (sX >= 0 && missingFrames > 0 && missingFrames <= DISAPPEAR_GRACE) {
+                    boolean fallen = sFallConf >= FALL_CONFIDENCE_THRESHOLD;
+                    int bx = (int) Math.round(sX);
+                    int by = (int) Math.round(sY);
+                    int bw = fallen
+                            ? (int) Math.round(sW)
+                            : (int) Math.max(1, Math.round(sH * (fallRatio - 0.3)));
+                    int bh = fallen
+                            ? (int) Math.max(1, Math.round(sW / (fallRatio + 0.2)))
+                            : (int) Math.round(sH);
                     persons.add(new Person(1, bx, by, bw, bh));
                 } else if (missingFrames > DISAPPEAR_GRACE) {
-                    // Reset smoothed box after prolonged absence
                     sX = -1;
+                    sFallConf = 0;
                 }
             }
 

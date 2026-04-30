@@ -1,16 +1,17 @@
 // src/main/java/com/elderlyfall/detection/FallDetector.java
 package com.elderlyfall.detection;
 
+import java.util.HashMap;
+import java.util.Map;
+import java.util.function.Consumer;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.elderlyfall.alert.AlertService;
 import com.elderlyfall.config.ConfigLoader;
 import com.elderlyfall.model.Frame;
 import com.elderlyfall.model.Person;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.util.HashMap;
-import java.util.Map;
-import java.util.function.Consumer;
 
 /**
  * Analyses each Frame for prolonged falls.
@@ -31,9 +32,11 @@ public class FallDetector {
     private final String alertPhoneNumber;
 
     // Per-person state
-    private final Map<Integer, Integer> floorFrameCounts  = new HashMap<>();
-    private final Map<Integer, Boolean> alertAlreadySent  = new HashMap<>();
-    private final Map<Integer, Integer> maxFloorFrames    = new HashMap<>();
+    private final Map<Integer, Integer> floorFrameCounts      = new HashMap<>();
+    private final Map<Integer, Boolean> alertAlreadySent     = new HashMap<>();
+    private final Map<Integer, Integer> maxFloorFrames       = new HashMap<>();
+    private final Map<Integer, Integer> previousHeight       = new HashMap<>();
+    private final Map<Integer, Integer> consecutiveFloorFrames = new HashMap<>();
 
     // UI callback
     private Consumer<Integer> onAlertCallback;
@@ -58,23 +61,43 @@ public class FallDetector {
         }
 
         for (Person p : frame.getPersons()) {
-            if (p.isOnFloor(fallRatio)) {
-                handleOnFloor(p);
+            int id = p.getId();
+            int currHeight = p.getHeight();
+            int prevHeight = previousHeight.getOrDefault(id, currHeight);
+            previousHeight.put(id, currHeight);
+            
+            // Detect sudden vertical drop (sign of falling)
+            boolean suddenDrop = prevHeight > 0 && (prevHeight - currHeight) > (prevHeight * 0.3); // >30% height loss
+            
+            if (p.isOnFloor(fallRatio) || suddenDrop) {
+                handleOnFloor(p, suddenDrop);
             } else {
                 handleOffFloor(p);
             }
         }
     }
 
-    private void handleOnFloor(Person p) {
+    private void handleOnFloor(Person p, boolean suddenDrop) {
         int id    = p.getId();
+        
+        // If sudden drop detected, immediately trigger alert (likely a real fall)
+        if (suddenDrop) {
+            consecutiveFloorFrames.put(id, alertFrameThreshold);
+            logger.warn("Person {} detected sudden drop! Likely falling.", id);
+        } else {
+            // Increment floor frame count for gradual detection
+            consecutiveFloorFrames.merge(id, 1, Integer::sum);
+        }
+        
         int count = floorFrameCounts.merge(id, 1, Integer::sum);
         maxFloorFrames.merge(id, count, Integer::max);
 
-        logger.debug("Person {} on floor for {} frames (ratio={:.2f})",
-                id, count, (double) p.getWidth() / Math.max(1, p.getHeight()));
+        logger.debug("Person {} on floor for {} consecutive frames (ratio={:.2f})",
+                id, consecutiveFloorFrames.getOrDefault(id, 0), 
+                (double) p.getWidth() / Math.max(1, p.getHeight()));
 
-        if (count >= alertFrameThreshold) {
+        int consecutiveCount = consecutiveFloorFrames.getOrDefault(id, 0);
+        if (consecutiveCount >= alertFrameThreshold) {
             boolean sent = alertAlreadySent.getOrDefault(id, false);
             if (!sent) {
                 alertActive = true;
@@ -99,6 +122,7 @@ public class FallDetector {
             }
         }
         floorFrameCounts.put(id, 0);
+        consecutiveFloorFrames.put(id, 0);
         alertAlreadySent.put(id, false);
     }
 
@@ -111,6 +135,8 @@ public class FallDetector {
         floorFrameCounts.clear();
         alertAlreadySent.clear();
         maxFloorFrames.clear();
+        previousHeight.clear();
+        consecutiveFloorFrames.clear();
         alertActive = false;
         logger.info("FallDetector reset.");
     }
